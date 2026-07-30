@@ -188,6 +188,10 @@ class BasePredictor:
             if self.args.visualize and (not self.source_type.tensor)
             else False
         )
+        if self.args.prompt_embeddings is not None:
+            if not getattr(self.model, "runtime_prompts", False):
+                raise ValueError("prompt_embeddings requires a YOLOE model exported with runtime_prompts=True.")
+            kwargs["prompt_embeddings"] = self.args.prompt_embeddings
         return self.model(im, *args, augment=self.args.augment, visualize=visualize, embed=self.args.embed, **kwargs)
 
     def pre_transform(self, im: list[np.ndarray]) -> list[np.ndarray]:

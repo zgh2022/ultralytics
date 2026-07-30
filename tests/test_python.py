@@ -9,6 +9,7 @@ import urllib
 import zipfile
 from copy import copy
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -18,7 +19,7 @@ from PIL import Image
 
 import ultralytics.data.build as data_build
 from tests import CFG, MODEL, MODELS, SOURCE, SOURCES_LIST, TASK_MODEL_DATA
-from ultralytics import RTDETR, YOLO
+from ultralytics import RTDETR, YOLO, YOLOE
 from ultralytics.cfg import get_cfg
 from ultralytics.data.build import build_dataloader, load_inference_source
 from ultralytics.data.utils import check_cls_dataset, check_det_dataset
@@ -100,6 +101,44 @@ def test_cfg_rejects_fuzzed_values():
         with pytest.raises((TypeError, ValueError), match=key):
             get_cfg(overrides={key: value})
     assert get_cfg(overrides={"auto_augment": None}).auto_augment is None
+
+
+def test_yoloe_runtime_prompt_files(tmp_path):
+    """Check prompt NPZ metadata, padding, and RKNN output channel trimming."""
+    from ultralytics.nn.backends.rknn import RKNNBackend
+
+    source = SimpleNamespace(model=SimpleNamespace(pt_path="models/yoloe-26n-seg.pt"))
+    prompt_file = tmp_path / "prompts.npz"
+    YOLOE.save_prompt_embeddings(source, prompt_file, torch.ones(1, 2, 512), ["bottle", "can"], max_prompts=4)
+
+    backend = RKNNBackend.__new__(RKNNBackend)
+    backend.max_prompts = 4
+    backend.prompt_model = "yoloe-26n-seg"
+    backend.runtime_prompts = True
+    backend._prompt_key = backend._prompt_input = None
+    backend._prompt_count = 0
+    backend.model = SimpleNamespace(inference=lambda inputs: [np.zeros((1, 40, 10), dtype=np.float32)])
+    output = backend.forward(torch.zeros(1, 32, 32, 3), prompt_embeddings=prompt_file)
+    assert backend.names == {0: "bottle", 1: "can"}
+    assert backend._prompt_input.shape == (1, 4, 512)
+    assert output[0].shape == (1, 38, 10)
+
+    with np.load(prompt_file, allow_pickle=False) as data:
+        assert data["model"].item() == "yoloe-26n-seg"
+        assert data["count"].item() == 2
+
+    backend.prompt_model = "yoloe-26s-seg"
+    backend._prompt_key = None
+    with pytest.raises(ValueError, match="expects 'yoloe-26s-seg'"):
+        backend._load_prompt_embeddings(prompt_file)
+
+
+def test_yoloe_visual_prompt_validation():
+    """Check the public visual prompt helper rejects incomplete annotations before predictor setup."""
+    with pytest.raises(ValueError, match="bboxes.*cls"):
+        YOLOE.get_visual_prompt_pe(SimpleNamespace(), "reference.jpg", {"bboxes": [[0, 0, 1, 1]]})
+    with pytest.raises(ValueError, match="one class ID per box"):
+        YOLOE.get_visual_prompt_pe(SimpleNamespace(), "reference.jpg", {"bboxes": [[0, 0, 1, 1]], "cls": [0, 1]})
 
 
 def skip_rpi_semantic():

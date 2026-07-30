@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,20 +42,69 @@ def parse_boxes(value: str) -> np.ndarray:
     return np.asarray(boxes, dtype=np.float32)
 
 
-def save_prompt(output: Path, embeddings: torch.Tensor, names: list[str], max_prompts: int) -> None:
-    embeddings = embeddings.detach().float().cpu().numpy()
-    if embeddings.shape[0] != 1 or embeddings.shape[2] != 512:
-        raise ValueError(f"unexpected embedding shape: {embeddings.shape}")
-    count = embeddings.shape[1]
-    if count > max_prompts:
-        raise ValueError(f"got {count} prompts, but detector supports at most {max_prompts}")
-    padded = np.zeros((1, max_prompts, 512), dtype=np.float32)
-    padded[:, :count] = embeddings
-    output.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(output, embeddings=padded, names=np.asarray(names), count=np.int64(count))
+def save_prompt(model: YOLOE, output: Path, embeddings: torch.Tensor, names: list[str], max_prompts: int) -> None:
+    model.save_prompt_embeddings(output, embeddings, names, max_prompts=max_prompts)
+    active = embeddings.detach().float().cpu().numpy()[0]
     print(f"saved: {output.resolve()}")
-    print(f"active prompts ({count}/{max_prompts}): {names}")
-    print(f"active embedding norms: {np.linalg.norm(padded[0, :count], axis=1).tolist()}")
+    print(f"active prompts ({len(names)}/{max_prompts}): {names}")
+    print(f"active embedding norms: {np.linalg.norm(active, axis=1).tolist()}")
+
+
+def get_visual_embeddings(model: YOLOE, image: Path, boxes: np.ndarray, class_ids: list[int], imgsz: int):
+    """Extract one embedding for each class present in an image."""
+    unique_ids = sorted(set(class_ids))
+    embeddings = model.get_visual_prompt_pe(
+        image,
+        {"bboxes": boxes, "cls": np.asarray(class_ids)},
+        imgsz=imgsz,
+        device="cpu",
+    )
+    if embeddings.shape[1] != len(unique_ids):
+        raise RuntimeError(f"expected {len(unique_ids)} visual embeddings, got {embeddings.shape[1]}")
+    return unique_ids, embeddings
+
+
+def load_visual_manifest(path: Path) -> tuple[list[str], list[dict]]:
+    """Load a multi-reference visual prompt manifest."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    names, images = data.get("names"), data.get("images")
+    if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
+        raise ValueError("manifest 'names' must be a non-empty list of class names")
+    if not isinstance(images, list) or not images:
+        raise ValueError("manifest 'images' must be a non-empty list")
+    return names, images
+
+
+def make_manifest_embeddings(model: YOLOE, manifest: Path, imgsz: int) -> tuple[torch.Tensor, list[str]]:
+    """Average normalized visual embeddings for each class across reference images."""
+    names, entries = load_visual_manifest(manifest)
+    sums = [None] * len(names)
+    counts = [0] * len(names)
+    for entry in entries:
+        image = Path(entry["image"])
+        if not image.is_absolute():
+            image = manifest.parent / image
+        boxes = np.asarray(entry["boxes"], dtype=np.float32)
+        class_ids = [int(value) for value in entry["class_ids"]]
+        if boxes.ndim != 2 or boxes.shape[1] != 4 or len(boxes) != len(class_ids):
+            raise ValueError(f"{image}: 'boxes' must contain one xyxy box per class ID")
+        if any(class_id < 0 or class_id >= len(names) for class_id in class_ids):
+            raise ValueError(f"{image}: class IDs must index manifest names 0..{len(names) - 1}")
+        unique_ids, embeddings = get_visual_embeddings(model, image, boxes, class_ids, imgsz)
+        for row, class_id in enumerate(unique_ids):
+            value = embeddings[0, row].detach().float()
+            sums[class_id] = value if sums[class_id] is None else sums[class_id] + value
+            counts[class_id] += 1
+    if any(count == 0 for count in counts):
+        missing = [names[i] for i, count in enumerate(counts) if count == 0]
+        raise ValueError(f"manifest has no reference boxes for classes: {missing}")
+    embeddings = torch.stack([value / count for value, count in zip(sums, counts)])
+    return torch.nn.functional.normalize(embeddings, dim=-1).unsqueeze(0), names
+
+
+def safe_stem(value: str) -> str:
+    """Return a portable filename stem for a class name."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._") or "class"
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
@@ -73,20 +124,23 @@ def parse_args() -> argparse.Namespace:
 
     visual = subparsers.add_parser("visual")
     add_common(visual)
-    visual.add_argument("--image", type=Path, required=True)
-    visual.add_argument("--boxes", required=True)
+    source = visual.add_mutually_exclusive_group(required=True)
+    source.add_argument("--image", type=Path)
+    source.add_argument("--manifest", type=Path, help="JSON manifest containing multiple reference images")
+    visual.add_argument("--boxes")
     visual.add_argument(
         "--class-ids",
         help="comma-separated IDs; default gives every box a separate class",
     )
     visual.add_argument("--names", nargs="+")
     visual.add_argument("--imgsz", type=int, default=640)
+    visual.add_argument("--per-class-dir", type=Path, help="also save one NPZ per visual class")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    weights = args.weights.resolve()
+    weights = args.weights.expanduser().absolute()
     model = YOLOE(str(weights))
 
     if args.mode == "text":
@@ -95,39 +149,33 @@ def main() -> None:
             embeddings = model.get_text_pe(args.prompts)
         names = args.prompts
     else:
-        boxes = parse_boxes(args.boxes)
-        class_ids = [int(item) for item in args.class_ids.split(",")] if args.class_ids else list(range(len(boxes)))
-        if len(class_ids) != len(boxes):
-            raise ValueError("--class-ids must contain one ID per box")
-        unique_ids = sorted(set(class_ids))
-        if unique_ids != list(range(len(unique_ids))):
-            raise ValueError("class IDs must be contiguous and start at 0")
-        names = args.names or [f"object{i}" for i in unique_ids]
-        if len(names) != len(unique_ids):
-            raise ValueError("--names must contain one name per unique class ID")
+        if args.manifest:
+            embeddings, names = make_manifest_embeddings(model, args.manifest.resolve(), args.imgsz)
+        else:
+            if not args.boxes:
+                raise ValueError("--image requires --boxes")
+            boxes = parse_boxes(args.boxes)
+            class_ids = [int(item) for item in args.class_ids.split(",")] if args.class_ids else list(range(len(boxes)))
+            if len(class_ids) != len(boxes):
+                raise ValueError("--class-ids must contain one ID per box")
+            unique_ids, embeddings = get_visual_embeddings(model, args.image.resolve(), boxes, class_ids, args.imgsz)
+            if unique_ids != list(range(len(unique_ids))):
+                raise ValueError("class IDs must be contiguous and start at 0")
+            names = args.names or [f"object{i}" for i in unique_ids]
+            if len(names) != len(unique_ids):
+                raise ValueError("--names must contain one name per unique class ID")
 
-        # Stop after get_vpe instead of running a redundant detection on the
-        # reference image. This also avoids a tuple postprocessing bug in 8.4.69.
-        from ultralytics.models.yolo.yoloe.predict import YOLOEVPSegPredictor
+        if args.per_class_dir:
+            for index, name in enumerate(names):
+                save_prompt(
+                    model,
+                    args.per_class_dir / f"{index}_{safe_stem(name)}.npz",
+                    embeddings[:, index : index + 1],
+                    [name],
+                    args.max_prompts,
+                )
 
-        predictor = YOLOEVPSegPredictor(
-            overrides={
-                "task": "segment",
-                "mode": "predict",
-                "save": False,
-                "verbose": False,
-                "batch": 1,
-                "device": "cpu",
-                "half": False,
-                "imgsz": args.imgsz,
-            },
-            _callbacks=model.callbacks,
-        )
-        predictor.set_prompts({"bboxes": boxes, "cls": np.asarray(class_ids)})
-        predictor.setup_model(model=model.model, verbose=False)
-        embeddings = predictor.get_vpe(str(args.image))
-
-    save_prompt(args.output, embeddings, names, args.max_prompts)
+    save_prompt(model, args.output, embeddings, names, args.max_prompts)
 
 
 if __name__ == "__main__":

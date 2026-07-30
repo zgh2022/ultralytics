@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from ultralytics.cfg import get_cfg
@@ -271,6 +272,84 @@ class YOLOE(Model):
         """Get text positional embeddings for the given texts."""
         assert isinstance(self.model, YOLOEModel)
         return self.model.get_text_pe(texts)
+
+    def save_prompt_embeddings(
+        self, file: str | Path, embeddings: torch.Tensor, names: list[str], max_prompts: int = 8
+    ) -> Path:
+        """Save text or visual prompt embeddings for a runtime-prompt exported model.
+
+        Args:
+            file (str | Path): Destination NPZ path.
+            embeddings (torch.Tensor): Prompt tensor shaped ``[1, N, 512]``.
+            names (list[str]): Class name for each active prompt row.
+            max_prompts (int): Fixed prompt capacity used during model export.
+
+        Returns:
+            (Path): Saved prompt file path.
+        """
+        embeddings = embeddings.detach().float().cpu().numpy()
+        if embeddings.ndim != 3 or embeddings.shape[0] != 1 or embeddings.shape[2] != 512:
+            raise ValueError(f"Expected prompt embeddings shaped [1,N,512], got {embeddings.shape}.")
+        count = embeddings.shape[1]
+        if len(names) != count:
+            raise ValueError(f"Expected {count} prompt names, got {len(names)}.")
+        if not 0 < count <= max_prompts:
+            raise ValueError(f"Prompt count {count} must be between 1 and max_prompts={max_prompts}.")
+
+        padded = np.zeros((1, max_prompts, 512), dtype=np.float32)
+        padded[:, :count] = embeddings
+        path = Path(file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        model_name = Path(getattr(self, "ckpt_path", None) or getattr(self.model, "pt_path", "")).stem
+        np.savez(
+            path,
+            embeddings=padded,
+            names=np.asarray(names),
+            count=np.int64(count),
+            model=np.asarray(model_name),
+        )
+        return path
+
+    def get_visual_prompt_pe(
+        self,
+        source: str | Path | np.ndarray,
+        visual_prompts: dict[str, list],
+        imgsz: int = 640,
+        device: str | int | None = None,
+    ) -> torch.Tensor:
+        """Generate visual prompt embeddings from boxes on one reference image.
+
+        Args:
+            source (str | Path | np.ndarray): Reference image.
+            visual_prompts (dict[str, list]): Pixel-space ``bboxes`` in xyxy format and one integer ``cls`` per box.
+            imgsz (int): Reference image inference size.
+            device (str | int, optional): Device used to generate embeddings.
+
+        Returns:
+            (torch.Tensor): Visual prompt embeddings shaped ``[1, N, 512]``, ordered by sorted class ID.
+        """
+        if not {"bboxes", "cls"} <= visual_prompts.keys():
+            raise ValueError("visual_prompts must contain 'bboxes' and 'cls'.")
+        if len(visual_prompts["bboxes"]) != len(visual_prompts["cls"]):
+            raise ValueError("visual_prompts must contain one class ID per box.")
+
+        from ultralytics.models.yolo.yoloe.predict import YOLOEVPSegPredictor
+
+        predictor = YOLOEVPSegPredictor(
+            overrides={
+                "task": "segment",
+                "mode": "predict",
+                "save": False,
+                "verbose": False,
+                "batch": 1,
+                "device": device,
+                "imgsz": imgsz,
+            },
+            _callbacks=self.callbacks,
+        )
+        predictor.set_prompts(visual_prompts.copy())
+        predictor.setup_model(model=self.model, verbose=False)
+        return predictor.get_vpe(source)
 
     def get_visual_pe(self, img, visual):
         """Get visual positional embeddings for the given image and visual features.

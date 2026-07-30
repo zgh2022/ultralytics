@@ -85,8 +85,10 @@ from ultralytics.nn.autobackend import AutoBackend, check_class_names, default_c
 from ultralytics.nn.modules import (
     OBB,
     OBB26,
+    BNContrastiveHead,
     C2f,
     Classify,
+    ContrastiveHead,
     Depth,
     Detect,
     Pose,
@@ -96,7 +98,14 @@ from ultralytics.nn.modules import (
     Segment26,
     SemanticSegment,
 )
-from ultralytics.nn.tasks import ClassificationModel, DepthModel, DetectionModel, SegmentationModel, WorldModel
+from ultralytics.nn.tasks import (
+    ClassificationModel,
+    DepthModel,
+    DetectionModel,
+    SegmentationModel,
+    WorldModel,
+    YOLOEModel,
+)
 from ultralytics.utils import (
     ARM64,
     DEFAULT_CFG,
@@ -160,7 +169,19 @@ def export_formats():
             ".onnx",
             True,
             True,
-            ["batch", "data", "dynamic", "quantize", "opset", "simplify", "nms", "fraction"],
+            [
+                "batch",
+                "data",
+                "dynamic",
+                "quantize",
+                "opset",
+                "simplify",
+                "nms",
+                "fraction",
+                "runtime_prompts",
+                "prompt_boxes_only",
+                "max_prompts",
+            ],
             "base",
         ],
         [
@@ -211,7 +232,18 @@ def export_formats():
             "_rknn_model",
             False,
             False,
-            ["batch", "name", "quantize", "opset", "simplify", "data", "fraction"],
+            [
+                "batch",
+                "name",
+                "quantize",
+                "opset",
+                "simplify",
+                "data",
+                "fraction",
+                "runtime_prompts",
+                "prompt_boxes_only",
+                "max_prompts",
+            ],
             "isolated-rknn",
         ],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"], "executorch"],
@@ -725,6 +757,18 @@ class Exporter:
                 self.args.quantize = 8
             elif self.args.quantize is None:
                 self.args.quantize = 16
+        if self.args.runtime_prompts:
+            if fmt not in {"onnx", "rknn"}:
+                raise ValueError("YOLOE runtime prompts are supported only for ONNX and RKNN exports.")
+            if not isinstance(model, YOLOEModel) or hasattr(model.model[-1], "lrpc"):
+                raise ValueError("runtime_prompts=True requires a text/visual-prompt YOLOE checkpoint.")
+            if self.args.batch != 1 or self.args.dynamic or self.args.nms:
+                raise ValueError("YOLOE runtime prompts require batch=1, dynamic=False, and nms=False.")
+            if self.args.quantize == 8:
+                raise ValueError("YOLOE runtime-prompt INT8 export is not supported; use quantize=16.")
+            model.end2end = False
+        elif self.args.prompt_boxes_only:
+            raise ValueError("prompt_boxes_only=True requires runtime_prompts=True.")
         if fmt == "ascend":
             # No SoC allowlist: valid --soc_version values depend on which Ascend-cann-kernels-* packages are
             # installed, so a hardcoded list would reject valid targets. ATC reports an unknown SoC itself.
@@ -872,7 +916,15 @@ class Exporter:
                 m.xyxy = self.args.nms and fmt != "coreml"
                 m.shape = None  # reset cached shape for new export input size
                 if hasattr(model, "pe") and hasattr(m, "fuse") and not hasattr(m, "lrpc"):  # for YOLOE models
-                    m.fuse(model.pe.to(self.device))
+                    if self.args.runtime_prompts:
+                        for contrastive in m.cv4:
+                            if isinstance(contrastive, (BNContrastiveHead, ContrastiveHead)):
+                                contrastive.max_prompts = self.args.max_prompts
+                                contrastive.forward = contrastive.forward_export
+                        m.nc = self.args.max_prompts
+                        m.runtime_prompts = True
+                    else:
+                        m.fuse(model.pe.to(self.device))
             elif isinstance(m, C2f) and not is_tf_format:
                 # EdgeTPU does not support FlexSplitV while split provides cleaner ONNX graph
                 m.forward = m.forward_split
@@ -885,14 +937,32 @@ class Exporter:
             # predict/val accept both forms.
             model = ClassMapModel(model)
 
+        prompt_embeddings = None
+        inference_model = model
+        if self.args.runtime_prompts:
+            prompt_embeddings = torch.nn.functional.normalize(
+                torch.randn(1, self.args.max_prompts, model.model[-1].embed, device=self.device), dim=-1
+            )
+            model.names = {i: f"prompt{i}" for i in range(self.args.max_prompts)}
+            inference_model = YOLOERuntimePromptModel(
+                model, boxes_only=self.args.prompt_boxes_only, max_prompts=self.args.max_prompts
+            )
+
         y = None
         for _ in range(2):  # dry runs
-            y = NMSModel(model, self.args)(im) if self.args.nms and fmt not in {"coreml", "imx"} else model(im)
+            y = (
+                inference_model(im, prompt_embeddings)
+                if prompt_embeddings is not None
+                else NMSModel(model, self.args)(im)
+                if self.args.nms and fmt not in {"coreml", "imx"}
+                else model(im)
+            )
         if self.args.quantize == 16 and fmt in {"onnx", "torchscript"} and self.device.type != "cpu":
             im, model = im.half(), model.half()  # to FP16
 
         # Assign
         self.im = im
+        self.prompt_embeddings = prompt_embeddings
         self.model = model
         self.file = file
         self.output_shape = (
@@ -920,6 +990,13 @@ class Exporter:
             "channels": model.yaml.get("channels", 3),
             "end2end": getattr(model, "end2end", False),
         }  # model metadata
+        if self.args.runtime_prompts:
+            prompt_model = Path(getattr(model, "pt_path", None) or self.file).stem
+            self.metadata.update(
+                {"runtime_prompts": True, "max_prompts": self.args.max_prompts, "prompt_model": prompt_model}
+            )
+            if self.args.prompt_boxes_only:
+                self.metadata["task"] = "detect"
         if self.dla is not None:
             self.metadata["dla"] = self.dla  # make sure `AutoBackend` uses correct dla device if it has one
         if model.task == "pose":
@@ -955,8 +1032,8 @@ class Exporter:
             imgsz = self.imgsz[0] if square else str(self.imgsz)[1:-1].replace(" ", "")
             q = "quantize=16" if self.args.quantize == 16 else ""  # FP16 inference flag for the val/predict hint
             inference_commands = (
-                f"\nPredict:         yolo predict task={model.task} model={f} imgsz={imgsz} {q}"
-                f"\nValidate:        yolo val task={model.task} model={f} imgsz={imgsz} data={data} {q} {s}"
+                f"\nPredict:         yolo predict task={self.metadata['task']} model={f} imgsz={imgsz} {q}"
+                f"\nValidate:        yolo val task={self.metadata['task']} model={f} imgsz={imgsz} data={data} {q} {s}"
                 if fmt in AutoBackend._BACKEND_MAP
                 else ""
             )
@@ -1046,7 +1123,9 @@ class Exporter:
             assert TORCH_1_13, f"'nms=True' ONNX export requires torch>=1.13 (found torch=={TORCH_VERSION})"
 
         f = str(self.file.with_suffix(".onnx"))
-        output_names = ["output0", "output1"] if self.model.task == "segment" else ["output0"]
+        output_names = (
+            ["output0", "output1"] if self.model.task == "segment" and not self.args.prompt_boxes_only else ["output0"]
+        )
         dynamic = self.args.dynamic
         if dynamic:
             dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}  # shape(1,3,640,640)
@@ -1065,11 +1144,17 @@ class Exporter:
 
         with arange_patch(dynamic=bool(dynamic), quantize=self.args.quantize, fmt=self.args.format):
             torch2onnx(
-                NMSModel(self.model, self.args) if self.args.nms else self.model,
-                self.im,
+                YOLOERuntimePromptModel(
+                    self.model, boxes_only=self.args.prompt_boxes_only, max_prompts=self.args.max_prompts
+                )
+                if self.args.runtime_prompts
+                else NMSModel(self.model, self.args)
+                if self.args.nms
+                else self.model,
+                (self.im, self.prompt_embeddings) if self.args.runtime_prompts else self.im,
                 f,
                 opset=opset,
-                input_names=["images"],
+                input_names=["images", "prompt_embeddings"] if self.args.runtime_prompts else ["images"],
                 output_names=output_names,
                 dynamic=dynamic or None,
             )
@@ -1087,6 +1172,8 @@ class Exporter:
 
             except Exception as e:
                 LOGGER.warning(f"{prefix} simplifier failure: {e}")
+        if self.args.runtime_prompts:
+            model_onnx = onnx.shape_inference.infer_shapes(model_onnx)
 
         # CANN requires the optional score-threshold input on ONNX NonMaxSuppression nodes. Scores were already
         # filtered by args.conf in NMSModel, so zero preserves the graph's semantics.
@@ -1488,6 +1575,9 @@ class Exporter:
             dataset=rknn_dataset,
             metadata=self.metadata,
             prefix=prefix,
+            runtime_prompts=self.args.runtime_prompts,
+            max_prompts=self.args.max_prompts,
+            imgsz=self.imgsz,
         )
 
     @try_export
@@ -1767,6 +1857,24 @@ class ExportWrapper(torch.nn.Module):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(self._model, name)
+
+
+class YOLOERuntimePromptModel(ExportWrapper):
+    """Expose YOLOE prompt embeddings as a second export input."""
+
+    def __init__(self, model, boxes_only=False, max_prompts=8):
+        """Initialize the runtime-prompt wrapper."""
+        super().__init__(model)
+        self.boxes_only = boxes_only
+        self.max_prompts = max_prompts
+
+    def forward(self, images, prompt_embeddings):
+        """Run YOLOE inference using precomputed text or visual embeddings."""
+        outputs = self._model.predict(images, vpe=prompt_embeddings)
+        if self.boxes_only:
+            detections = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+            return detections[:, : 4 + self.max_prompts]
+        return outputs
 
 
 class QNNModel(ExportWrapper):

@@ -1084,6 +1084,7 @@ class YOLOEDetect(Detect):
     """
 
     is_fused = False
+    runtime_prompts = False
 
     def __init__(
         self, nc: int = 80, embed: int = 512, with_bn: bool = False, reg_max=16, end2end=False, ch: tuple = ()
@@ -1246,7 +1247,8 @@ class YOLOEDetect(Detect):
             return {}
         bs = x[0].shape[0]  # batch size
         boxes = torch.cat([box_head[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
-        self.nc = x[-1].shape[1]
+        if not (self.export and self.runtime_prompts):
+            self.nc = x[-1].shape[1]
         scores = torch.cat(
             [contrastive_head[i](cls_head[i](x[i]), x[-1]).reshape(bs, self.nc, -1) for i in range(self.nl)], dim=-1
         )

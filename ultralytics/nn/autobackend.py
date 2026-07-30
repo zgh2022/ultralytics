@@ -281,8 +281,12 @@ class AutoBackend(nn.Module):
         forward_kwargs = {}
         if self.format == "pt":
             forward_kwargs = {"augment": augment, "visualize": visualize, "embed": embed, **kwargs}
+        elif self.format == "rknn" and kwargs.get("prompt_embeddings") is not None:
+            forward_kwargs = {"prompt_embeddings": kwargs["prompt_embeddings"]}
 
         y = self.backend.forward(im, **forward_kwargs)
+        if self.format == "rknn" and kwargs.get("prompt_embeddings") is not None:
+            self.names = self.backend.names
 
         if isinstance(y, (list, tuple)):
             if len(self.names) == 999 and (self.task == "segment" or len(y) == 2):  # segments and names not defined

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from ultralytics.utils import LOGGER
@@ -55,16 +56,78 @@ class RKNNBackend(BaseBackend):
             from ultralytics.utils import YAML
 
             self.apply_metadata(YAML.load(metadata_file))
+        self._prompt_key = None
+        self._prompt_input = None
+        self._prompt_count = 0
 
-    def forward(self, im: torch.Tensor) -> list:
+    def _load_prompt_embeddings(self, value: str | Path | np.ndarray | torch.Tensor) -> np.ndarray:
+        """Load, validate, pad, and cache a runtime YOLOE prompt tensor."""
+        key = None
+        names = None
+        count = None
+        if isinstance(value, (str, Path)):
+            path = Path(value).resolve()
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            key = (str(path), path.stat().st_mtime_ns)
+            if key == self._prompt_key:
+                return self._prompt_input
+            with np.load(path, allow_pickle=False) as data:
+                embeddings = data["embeddings"].astype(np.float32)
+                count = int(data["count"]) if "count" in data.files else embeddings.shape[1]
+                names = [str(x) for x in data["names"]] if "names" in data.files else None
+                prompt_model = str(data["model"].item()) if "model" in data.files else None
+            expected_model = getattr(self, "prompt_model", None)
+            if prompt_model and expected_model and prompt_model != expected_model:
+                raise ValueError(f"Prompt file is for '{prompt_model}', but the RKNN model expects '{expected_model}'.")
+        else:
+            embeddings = value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
+            embeddings = embeddings.astype(np.float32)
+
+        if embeddings.ndim != 3 or embeddings.shape[0] != 1 or embeddings.shape[2] != 512:
+            raise ValueError(f"Expected prompt embeddings shaped [1,N,512], got {embeddings.shape}.")
+        max_prompts = int(getattr(self, "max_prompts", embeddings.shape[1]))
+        count = embeddings.shape[1] if count is None else count
+        if not 0 < count <= embeddings.shape[1] <= max_prompts:
+            raise ValueError(f"Prompt count {count} and shape {embeddings.shape} exceed max_prompts={max_prompts}.")
+        if embeddings.shape[1] < max_prompts:
+            embeddings = np.pad(embeddings, ((0, 0), (0, max_prompts - embeddings.shape[1]), (0, 0)))
+        if names is not None and len(names) != count:
+            raise ValueError(f"Prompt file contains {len(names)} names for {count} active prompts.")
+
+        self.names = {i: names[i] if names is not None else f"prompt{i}" for i in range(count)}
+        self._prompt_key = key
+        self._prompt_input = np.ascontiguousarray(embeddings, dtype=np.float32)
+        self._prompt_count = count
+        return self._prompt_input
+
+    def forward(self, im: torch.Tensor, prompt_embeddings=None) -> list:
         """Run inference on the Rockchip NPU.
 
         Args:
             im (torch.Tensor): Input image tensor in BCHW format, normalized to [0, 1].
+            prompt_embeddings (str | Path | np.ndarray | torch.Tensor, optional): Runtime YOLOE prompt NPZ or tensor.
 
         Returns:
             (list): Model predictions as a list of output arrays.
         """
         im = (im.cpu().numpy() * 255).astype("uint8")
-        im = im if isinstance(im, (list, tuple)) else [im]
-        return self.model.inference(inputs=im)
+        inputs = [im]
+        if getattr(self, "runtime_prompts", False):
+            if prompt_embeddings is None:
+                raise ValueError("This RKNN model requires prompt_embeddings='path/to/prompts.npz'.")
+            inputs.append(self._load_prompt_embeddings(prompt_embeddings))
+        elif prompt_embeddings is not None:
+            raise ValueError(
+                "prompt_embeddings was provided, but this RKNN model was not exported with runtime prompts."
+            )
+
+        outputs = self.model.inference(inputs=inputs)
+        if getattr(self, "runtime_prompts", False) and self._prompt_count < self.max_prompts:
+            for i, output in enumerate(outputs):
+                if output.ndim == 3 and output.shape[1] >= 4 + self.max_prompts:
+                    outputs[i] = np.concatenate(
+                        (output[:, : 4 + self._prompt_count], output[:, 4 + self.max_prompts :]), axis=1
+                    )
+                    break
+        return outputs

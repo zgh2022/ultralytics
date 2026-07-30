@@ -22,6 +22,9 @@ def onnx2rknn(
     metadata: dict | None = None,
     prefix: str = "",
     batch: int = 1,
+    runtime_prompts: bool = False,
+    max_prompts: int = 8,
+    imgsz: tuple[int, int] = (640, 640),
 ) -> str:
     """Export an ONNX model to RKNN format for Rockchip NPUs with optional INT8 quantization.
 
@@ -36,6 +39,9 @@ def onnx2rknn(
         metadata (dict | None): Metadata saved as ``metadata.yaml``.
         prefix (str): Prefix for log messages.
         batch (int): Inference batch size applied by RKNN Toolkit after loading the batch-1 ONNX model.
+        runtime_prompts (bool): Whether the ONNX graph has a second YOLOE prompt-embedding input.
+        max_prompts (int): Fixed number of prompt rows in the second input.
+        imgsz (tuple[int, int]): Static image height and width.
 
     Returns:
         (str): Path to the exported ``_rknn_model`` directory.
@@ -73,7 +79,15 @@ def onnx2rknn(
     rknn = RKNN(verbose=False)
     config = {"mean_values": [[0, 0, 0]], "std_values": [[255, 255, 255]], "target_platform": name}
     _check_rknn_return(rknn.config(**config), "config")
-    _check_rknn_return(rknn.load_onnx(model=onnx_file), "load_onnx")
+    load_kwargs = {"model": onnx_file}
+    if runtime_prompts:
+        load_kwargs.update(
+            {
+                "inputs": ["images", "prompt_embeddings"],
+                "input_size_list": [[1, 3, *imgsz], [1, max_prompts, 512]],
+            }
+        )
+    _check_rknn_return(rknn.load_onnx(**load_kwargs), "load_onnx")
     build_kwargs = {"do_quantization": use_int8}
     if use_int8:
         build_kwargs["dataset"] = str(dataset)

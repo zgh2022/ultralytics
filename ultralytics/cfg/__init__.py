@@ -259,6 +259,7 @@ CFG_INT_KEYS = frozenset(
         "line_width",
         "nbs",
         "save_period",
+        "max_prompts",
     }
 )
 CFG_INT_MIN = {  # minimum valid values for integer arguments used as divisors, sizes or seeds
@@ -267,6 +268,7 @@ CFG_INT_MIN = {  # minimum valid values for integer arguments used as divisors, 
     "mask_ratio": 1,
     "vid_stride": 1,
     "seed": 0,
+    "max_prompts": 1,
 }
 CFG_BOOL_KEYS = frozenset(
     {  # boolean-only arguments
@@ -303,6 +305,8 @@ CFG_BOOL_KEYS = frozenset(
         "channels_last",
         "end2end",
         "cls_remap",
+        "runtime_prompts",
+        "prompt_boxes_only",
     }
 )
 CFG_STR_KEYS = frozenset({"optimizer", "split", "copy_paste_mode", "auto_augment"})

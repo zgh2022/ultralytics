@@ -21,7 +21,7 @@ from tests import MODEL, SOURCE
 from tests.conftest import isolated_model_path
 from ultralytics import YOLO
 from ultralytics.cfg import TASK2DATA, TASK2MODEL, TASKS, _handle_deprecation, get_cfg
-from ultralytics.engine.exporter import EXPORT_ENVS, Exporter, export_formats, validate_args
+from ultralytics.engine.exporter import EXPORT_ENVS, Exporter, YOLOERuntimePromptModel, export_formats, validate_args
 from ultralytics.utils import (
     ARM64,
     IS_RASPBERRYPI,
@@ -207,8 +207,9 @@ def test_export_rknn_batch_expansion(monkeypatch, tmp_path):
 
     image = tmp_path / "image.jpg"
     exporter = SimpleNamespace(
-        args=SimpleNamespace(opset=None, quantize=8, name="rk3588", batch=8),
+        args=SimpleNamespace(opset=None, quantize=8, name="rk3588", batch=8, runtime_prompts=False, max_prompts=8),
         im=torch.zeros(8, 3, 32, 32),
+        imgsz=[32, 32],
         file=tmp_path / "model.pt",
         metadata={},
         get_int8_calibration_dataloader=lambda prefix: SimpleNamespace(dataset=SimpleNamespace(im_files=[image])),
@@ -217,6 +218,41 @@ def test_export_rknn_batch_expansion(monkeypatch, tmp_path):
     Exporter.export_rknn(exporter)
     assert calls["onnx_batch"] == 1
     assert calls["batch"] == 8
+
+
+def test_export_rknn_runtime_prompt_arguments(monkeypatch, tmp_path):
+    """Check RKNN receives the static second-input configuration."""
+    calls = {}
+    monkeypatch.setattr(
+        "ultralytics.utils.export.rknn.onnx2rknn", lambda **kwargs: calls.update(kwargs) or kwargs["output_dir"]
+    )
+    monkeypatch.setattr("ultralytics.engine.exporter.file_size", lambda _: 1)
+    exporter = SimpleNamespace(
+        args=SimpleNamespace(opset=None, quantize=16, name="rk3588", batch=1, runtime_prompts=True, max_prompts=5),
+        im=torch.zeros(1, 3, 32, 64),
+        imgsz=[32, 64],
+        file=tmp_path / "model.pt",
+        metadata={},
+    )
+    exporter.export_onnx = lambda: tmp_path / "model.onnx"
+    Exporter.export_rknn(exporter)
+    assert calls["runtime_prompts"] is True
+    assert calls["max_prompts"] == 5
+    assert calls["imgsz"] == [32, 64]
+
+
+def test_yoloe_runtime_prompt_boxes_only():
+    """Check the export wrapper removes segmentation channels and prototypes."""
+
+    class PromptModel(torch.nn.Module):
+        task = "segment"
+
+        def predict(self, images, vpe):
+            return torch.zeros(images.shape[0], 41, 10), torch.zeros(images.shape[0], 32, 8, 8)
+
+    model = YOLOERuntimePromptModel(PromptModel(), boxes_only=True, max_prompts=5)
+    output = model(torch.zeros(1, 3, 32, 32), torch.zeros(1, 5, 512))
+    assert output.shape == (1, 9, 10)
 
 
 def test_modelopt_quantize_onnx_excludes_sigmoid(monkeypatch):

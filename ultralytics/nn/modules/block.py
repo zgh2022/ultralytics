@@ -776,6 +776,14 @@ class ContrastiveHead(nn.Module):
         x = torch.einsum("bchw,bkc->bkhw", x, w)
         return x * self.logit_scale.exp() + self.bias
 
+    def forward_export(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """Calculate similarity with export-friendly matrix multiplication."""
+        x = F.normalize(x, dim=1, p=2)
+        w = w / torch.clamp(torch.linalg.vector_norm(w, dim=-1, keepdim=True), min=1e-6)
+        batch, _, height, width = x.shape
+        scores = torch.matmul(w, x.flatten(2))
+        return scores.reshape(batch, self.max_prompts, height, width) * self.logit_scale.exp() + self.bias
+
 
 class BNContrastiveHead(nn.Module):
     """Batch Norm Contrastive Head using batch norm instead of l2-normalization.
@@ -824,6 +832,14 @@ class BNContrastiveHead(nn.Module):
 
         x = torch.einsum("bchw,bkc->bkhw", x, w)
         return x * self.logit_scale.exp() + self.bias
+
+    def forward_export(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """Calculate similarity with export-friendly matrix multiplication."""
+        x = self.norm(x)
+        w = w / torch.clamp(torch.linalg.vector_norm(w, dim=-1, keepdim=True), min=1e-6)
+        batch, _, height, width = x.shape
+        scores = torch.matmul(w, x.flatten(2))
+        return scores.reshape(batch, self.max_prompts, height, width) * self.logit_scale.exp() + self.bias
 
 
 class RepBottleneck(Bottleneck):

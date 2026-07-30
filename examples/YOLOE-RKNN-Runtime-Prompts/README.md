@@ -1,5 +1,7 @@
 # YOLOE Runtime Prompts on RKNN
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 This example exports promptable YOLOE models to RKNN for RK3588/RK3588S. The exported graph has two fixed-shape
 inputs: the image and precomputed text or visual prompt embeddings. Prompt encoders remain on the host, while the
 Rockchip NPU runs the detector.
@@ -47,6 +49,11 @@ Prompt generation is required after export. RKNN does not encode text or inspect
 accepts the resulting small NPZ tensor. An NPZ is tied to the source checkpoint scale and cannot be shared between
 N/S/M/L/X models.
 
+The NPZ may be generated on an RK3588 CPU when the original PyTorch checkpoint and prompt encoder dependencies are
+installed there, which is how an on-board web application can create prompts interactively. This does not mean that
+the RKNN model or NPU generates the prompt. Pre-generating and caching NPZ files on a faster host is recommended for
+text prompts because loading the PyTorch checkpoint and MobileCLIP on the board is relatively slow.
+
 Generate text prompts with the framework API:
 
 ```python
@@ -74,11 +81,18 @@ are averaged and L2-normalized. This avoids introducing artificial object positi
 
 ```json
 {
-    "names": ["bottle", "can"],
-    "images": [
-        {"image": "refs/bottle_1.jpg", "boxes": [[120, 80, 220, 210]], "class_ids": [0]},
-        {"image": "refs/bottle_can.jpg", "boxes": [[25, 40, 90, 180], [240, 95, 330, 210]], "class_ids": [0, 1]}
-    ]
+  "names": ["bottle", "can"],
+  "images": [
+    { "image": "refs/bottle_1.jpg", "boxes": [[120, 80, 220, 210]], "class_ids": [0] },
+    {
+      "image": "refs/bottle_can.jpg",
+      "boxes": [
+        [25, 40, 90, 180],
+        [240, 95, 330, 210]
+      ],
+      "class_ids": [0, 1]
+    }
+  ]
 }
 ```
 

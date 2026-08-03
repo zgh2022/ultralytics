@@ -367,6 +367,41 @@ YOLOE supports both text-based and visual prompting. Using prompts is straightfo
         results[0].show()
         ```
 
+        Multiple reference images can be combined into one visual prompt. Use global, sequential class IDs across all
+        references; each image may contain any subset of the classes. YOLOE averages the visual embeddings for each
+        class across the images where it appears, normalizes them, and uses all classes in one target-image inference:
+
+        ```python
+        import numpy as np
+
+        from ultralytics import YOLOE
+        from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
+
+        model = YOLOE("yoloe-26l-seg.pt")
+        visual_prompts = {
+            "bboxes": [
+                np.array([[40, 60, 180, 280], [220, 80, 340, 260]]),
+                np.array([[100, 120, 260, 300]]),
+                np.array([[50, 90, 190, 310], [300, 100, 420, 280]]),
+            ],
+            "cls": [
+                np.array([0, 0]),  # Two class-0 examples in reference 1
+                np.array([1]),  # One class-1 example in reference 2
+                np.array([0, 1]),  # Both classes in reference 3
+            ],
+        }
+        results = model.predict(
+            "path/to/target.jpg",
+            refer_image=["path/to/reference-1.jpg", "path/to/reference-2.jpg", "path/to/reference-3.jpg"],
+            visual_prompts=visual_prompts,
+            predictor=YOLOEVPSegPredictor,
+        )
+
+        # Assign descriptive names and optionally save the aggregated profile for reuse or static export.
+        model.set_classes(["plastic bottle", "paper cup"], model.model.pe)
+        model.save_prompt_embeddings("bottle-cup.npz")
+        ```
+
         Using `refer_image` also sets the classes permanently, so you can run predictions without having to supply the same visual prompts again, and export the model while retaining the ability to still detect the same classes after export:
         ```python
         # After making prediction with `refer_image`, you can run predictions without passing visual_prompts again and still get the same classes back

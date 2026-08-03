@@ -456,7 +456,8 @@ class YOLOE(Model):
                 are computed.
             visual_prompts (dict[str, list]): Dictionary containing visual prompts for the model. Must include 'bboxes'
                 and 'cls' keys when non-empty.
-            refer_image (str | PIL.Image | np.ndarray, optional): Reference image for visual prompts.
+            refer_image (str | PIL.Image | np.ndarray | list, optional): Reference image or list of reference images for
+                visual prompts.
             predictor (callable): Custom predictor class for visual prompt predictions. Defaults to
                 YOLOEVPDetectPredictor.
             **kwargs (Any): Additional keyword arguments passed to the predictor.
@@ -480,6 +481,21 @@ class YOLOE(Model):
                 f"Expected equal number of bounding boxes and classes, but got {len(visual_prompts['bboxes'])} and "
                 f"{len(visual_prompts['cls'])} respectively"
             )
+            multi_reference = isinstance(refer_image, (list, tuple))
+            if multi_reference:
+                if not refer_image or len(refer_image) != len(visual_prompts["bboxes"]):
+                    raise ValueError("Multi-reference images, bounding boxes, and classes must have the same length.")
+                reference_classes = [np.asarray(c) for c in visual_prompts["cls"]]
+                for bboxes, classes in zip(visual_prompts["bboxes"], reference_classes):
+                    if classes.ndim != 1 or not classes.size or not np.issubdtype(classes.dtype, np.integer):
+                        raise ValueError(
+                            "Each reference image must use a non-empty one-dimensional integer class array."
+                        )
+                    if len(bboxes) != len(classes):
+                        raise ValueError("Each reference image must have equal numbers of bounding boxes and classes.")
+                class_ids = np.unique(np.concatenate(reference_classes))
+                if not np.array_equal(class_ids, np.arange(len(class_ids))):
+                    raise ValueError("Multi-reference class IDs must be sequential and start from 0.")
             if type(self.predictor) is not predictor:
                 args = get_cfg(overrides={**self.overrides, **kwargs})
                 self.predictor = predictor(
@@ -496,14 +512,18 @@ class YOLOE(Model):
                     _callbacks=self.callbacks,
                 )
 
-            num_cls = (
-                max(len(set(c)) for c in visual_prompts["cls"])
-                if isinstance(source, list) and refer_image is None  # means multiple images
-                else len(set(visual_prompts["cls"]))
-            )
+            if multi_reference:
+                num_cls = len(class_ids)
+            else:
+                num_cls = (
+                    max(len(set(c)) for c in visual_prompts["cls"])
+                    if isinstance(source, list) and refer_image is None  # means multiple images
+                    else len(set(visual_prompts["cls"]))
+                )
             self.model.model[-1].nc = num_cls
             self.model.names = [f"object{i}" for i in range(num_cls)]
-            self.predictor.set_prompts(visual_prompts.copy())
+            if not multi_reference:
+                self.predictor.set_prompts(visual_prompts.copy())
             self.predictor.setup_model(model=self.model, verbose=self.predictor.args.verbose)
 
             if refer_image is None and source is not None:
@@ -512,7 +532,23 @@ class YOLOE(Model):
                     # NOTE: set the first frame as refer image for videos/streams inference
                     refer_image = next(iter(dataset))[1][0]
             if refer_image is not None:
-                vpe = self.predictor.get_vpe(refer_image)
+                if multi_reference:
+                    vpe, class_counts = None, None
+                    for image, bboxes, classes in zip(refer_image, visual_prompts["bboxes"], reference_classes):
+                        unique_classes, local_classes = np.unique(classes, return_inverse=True)
+                        self.predictor.set_prompts({"bboxes": bboxes, "cls": local_classes})
+                        reference_vpe = self.predictor.get_vpe(image)
+                        if reference_vpe.shape[1] != len(unique_classes):
+                            raise RuntimeError("Visual prompt embeddings do not match the reference classes.")
+                        if vpe is None:
+                            vpe = reference_vpe.new_zeros(1, num_cls, reference_vpe.shape[-1])
+                            class_counts = reference_vpe.new_zeros(num_cls)
+                        indices = torch.as_tensor(unique_classes, device=vpe.device, dtype=torch.long)
+                        vpe[:, indices] += reference_vpe
+                        class_counts[indices] += 1
+                    vpe = torch.nn.functional.normalize(vpe / class_counts[None, :, None], dim=-1, p=2)
+                else:
+                    vpe = self.predictor.get_vpe(refer_image)
                 self.model.set_classes(self.model.names, vpe)
                 self.task = "segment" if isinstance(self.predictor, yolo.segment.SegmentationPredictor) else "detect"
                 self.predictor = None  # reset predictor

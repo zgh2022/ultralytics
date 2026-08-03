@@ -1828,6 +1828,67 @@ def test_yoloe_visual_prompt_verbose_false(capfd):
     assert "Ultralytics" not in output
 
 
+def test_yoloe_multi_reference_visual_prompts(monkeypatch, tmp_path):
+    """Verify class-wise aggregation and NPZ reuse for multi-reference visual prompts."""
+    from types import SimpleNamespace
+
+    from ultralytics import YOLOE
+    from ultralytics.engine.model import Model
+
+    vectors = torch.eye(6, 512)
+    reference_vpe = {
+        "reference-a.jpg": vectors[[0, 1]],  # classes 0 and 1
+        "reference-b.jpg": vectors[[2, 3]],  # classes 1 and 2
+        "reference-c.jpg": vectors[[4, 5]],  # classes 0 and 2
+    }
+
+    class MockVisualPredictor:
+        def __init__(self, overrides, _callbacks):
+            self.args = SimpleNamespace(verbose=overrides["verbose"])
+
+        def setup_model(self, model, verbose=True):
+            pass
+
+        def set_prompts(self, prompts):
+            self.prompts = prompts
+
+        def get_vpe(self, source):
+            embeddings = reference_vpe[source]
+            assert np.array_equal(np.unique(self.prompts["cls"]), np.arange(len(embeddings)))
+            return embeddings.unsqueeze(0)
+
+    monkeypatch.setattr(Model, "predict", lambda self, *args, **kwargs: self.model.pe)
+    model = YOLOE("yoloe-26n.yaml")
+    embeddings = model.predict(
+        "target.jpg",
+        refer_image=list(reference_vpe),
+        visual_prompts={
+            "bboxes": [np.ones((3, 4)), np.ones((2, 4)), np.ones((3, 4))],
+            "cls": [np.array([0, 0, 1]), np.array([1, 2]), np.array([2, 0, 2])],
+        },
+        predictor=MockVisualPredictor,
+        verbose=False,
+    )
+    expected = torch.nn.functional.normalize(
+        torch.stack(((vectors[0] + vectors[4]) / 2, (vectors[1] + vectors[2]) / 2, (vectors[3] + vectors[5]) / 2)),
+        dim=-1,
+    ).unsqueeze(0)
+    assert torch.equal(embeddings, expected)
+
+    profile = model.save_prompt_embeddings(tmp_path / "multi-reference.npz")
+    loaded = YOLOE("yoloe-26n-seg.yaml")
+    loaded.load_prompt_embeddings(profile)
+    assert torch.equal(loaded.model.pe, expected)
+
+    with pytest.raises(ValueError, match="sequential"):
+        model.predict(
+            "target.jpg",
+            refer_image=["reference-a.jpg", "reference-b.jpg"],
+            visual_prompts={"bboxes": [np.ones((1, 4))] * 2, "cls": [np.array([0]), np.array([2])]},
+            predictor=MockVisualPredictor,
+        )
+
+
 def test_yolov10():
     """Test YOLOv10 model training, validation, and prediction functionality."""
     model = YOLO("yolov10n.yaml")
